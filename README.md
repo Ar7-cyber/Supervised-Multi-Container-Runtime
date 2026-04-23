@@ -305,3 +305,93 @@ By implementing a supervisor-driven architecture along with workload generators,
 
 Overall, this project serves as a solid foundation for exploring advanced container technologies and can be extended to incorporate features such as namespaces, cgroups, and networking to more closely resemble production-grade container runtimes.
 
+---
+
+## Engineering Analysis
+
+### 1. Isolation Mechanisms
+The runtime achieves isolation primarily through **Linux namespaces** and filesystem isolation techniques.
+
+- **PID Namespace**: Ensures that processes inside a container have their own process ID space. Processes in one container cannot see or interfere with processes in another.
+- **UTS Namespace**: Allows each container to have its own hostname and domain name, providing identity isolation.
+- **Mount Namespace**: Gives each container its own view of the filesystem hierarchy, enabling independent mounts and preventing access to the host filesystem.
+
+For filesystem isolation, techniques like **chroot** or **pivot_root** are used:
+- `chroot` changes the apparent root directory for a process.
+- `pivot_root` switches the root filesystem entirely, making the container filesystem independent from the host.
+
+Despite these isolations, the **host kernel is shared across all containers**. This means:
+- All containers use the same kernel
+- Kernel-level resources (CPU scheduler, memory manager, device drivers) are shared
+- Isolation is logical, not physical
+
+---
+
+### 2. Supervisor and Process Lifecycle
+A long-running **supervisor process** is essential for managing container lifecycles.
+
+- When a container is created, the supervisor uses **fork()** to create a child process and **exec()** to run the container workload.
+- This establishes a **parent-child relationship**, where the supervisor tracks all container processes.
+- The supervisor is responsible for:
+  - Monitoring container state
+  - Handling failures and restarts
+  - Maintaining metadata (PID, status, resource usage)
+
+When a container process exits, it becomes a **zombie process** until the parent reaps it using `wait()` or `waitpid()`. The supervisor ensures proper **process reaping** to avoid resource leaks.
+
+Signals (e.g., SIGTERM, SIGKILL) are used to control container execution, allowing graceful or forced termination.
+
+---
+
+### 3. IPC, Threads, and Synchronization
+The project uses multiple **Inter-Process Communication (IPC)** mechanisms such as:
+- Pipes or sockets (for communication between components)
+- Shared memory or buffers (for logging/monitoring)
+
+A **bounded-buffer logging system** introduces concurrency challenges:
+- Multiple producers (workers/containers) may write logs simultaneously
+- A consumer (monitor/supervisor) reads logs
+
+Possible race conditions include:
+- Concurrent writes corrupting shared data
+- Reading incomplete or inconsistent data
+
+To handle this, synchronization mechanisms are used:
+- **Mutexes** ensure mutual exclusion when accessing shared buffers
+- **Condition variables / semaphores** manage coordination (e.g., buffer full/empty)
+- These choices balance correctness and performance
+
+---
+
+### 4. Memory Management and Enforcement
+**RSS (Resident Set Size)** measures the portion of a process’s memory that is currently loaded in physical RAM. However, it does not include:
+- Swapped-out memory
+- Shared memory fully attributed per process
+- Kernel memory usage
+
+The system distinguishes between:
+- **Soft limits**: Advisory limits that trigger warnings or throttling
+- **Hard limits**: Strict caps that cannot be exceeded
+
+This distinction allows flexibility while still enforcing safety.
+
+Memory enforcement must occur in **kernel space** because:
+- Only the kernel has full visibility and control over physical memory
+- User-space enforcement can be bypassed or is not authoritative
+- The kernel ensures fair and secure allocation across processes
+
+---
+
+### 5. Scheduling Behavior
+The observed behavior of workloads reflects how the **Linux scheduler** operates.
+
+- CPU-intensive tasks (e.g., CPU hog) consume more CPU time but are balanced with others through fair scheduling
+- I/O-bound tasks may get higher responsiveness due to blocking and waking behavior
+- Memory-intensive workloads may be affected by paging and allocation delays
+
+Linux scheduling aims to achieve:
+- **Fairness**: Equal CPU time distribution among processes
+- **Responsiveness**: Quick handling of interactive or I/O-bound tasks
+- **Throughput**: Maximizing total work done over time
+
+Experimental results show that the scheduler dynamically balances these goals, adjusting execution based on workload characteristics.
